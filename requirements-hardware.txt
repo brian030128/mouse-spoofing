@@ -1,0 +1,3 @@
+# Device access; dry runs and unit tests need only the standard library.
+pyserial==3.5
+hidapi==0.15.0

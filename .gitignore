@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv-hardware/
+.tools/
+firmware/build/
+firmware/**/build/
+hid-audit/
+data/
+path.json

@@ -3,6 +3,7 @@
 #include <esp_timer.h>
 #include <errno.h>
 #include <atomic>
+#include <math.h>
 #include "config.h"
 #include "usb_profile.h"
 
@@ -19,18 +20,31 @@ struct __attribute__((packed)) MouseReport {
   int16_t dx, dy;
 };
 static_assert(sizeof(MouseReport) == 6, "HID report layout mismatch");
+#include "circle_motion.h"
 struct Event { uint32_t due; MouseReport report; };
 Event events[MAX_EVENTS];
 unsigned expected = 0, loaded = 0, cursor = 0;
 bool running = false, releasePending = true;
-bool streaming = false;
+std::atomic<bool> streaming{false};
 uint32_t nextSequence = 0;
 std::atomic<uint8_t> heldButtons{0};
 SemaphoreHandle_t sent = nullptr;
+SemaphoreHandle_t hidMutex = nullptr, stateMutex = nullptr, streamDone = nullptr;
+QueueHandle_t streamQueue = nullptr;
+TaskHandle_t streamTask = nullptr;
+std::atomic<bool> streamSuccess{false};
+// Faults are printed by the UART owner, never from the USB producer task.
+std::atomic<unsigned> streamFault{0};
 std::atomic<uint8_t> idleRate{0};
-uint32_t lastReport = 0;
+std::atomic<uint32_t> lastReport{0};
 int64_t epoch = 0;
-uint32_t lastContact = 0, worstLate = 0;
+std::atomic<uint32_t> lastContact{0};
+uint32_t worstLate = 0;
+// Accessed under stateMutex, which is NEVER held across USB completion waits.
+uint32_t reportCount = 0, intervalMin = UINT32_MAX, intervalMax = 0, missedSlots = 0;
+int64_t firstCompletion = 0, lastCompletion = 0;
+CircleMotion circleMotion;
+bool circleReleasing = false;
 char line[128];
 unsigned lineLength = 0;
 bool overflow = false;
@@ -60,7 +74,7 @@ extern "C" void tud_hid_report_complete_cb(uint8_t, const uint8_t *, uint16_t) {
   if (sent) xSemaphoreGive(sent);
 }
 
-bool sendMouse(const MouseReport &report) {
+bool sendMouseLocked(const MouseReport &report) {
   if (!sent || !tud_hid_n_ready(0)) return false;
   xSemaphoreTake(sent, 0);  // discard an acknowledgement from an earlier timeout
   // Boot protocol uses buttons, signed 8-bit X/Y; report protocol uses the
@@ -73,7 +87,70 @@ bool sendMouse(const MouseReport &report) {
   // A timeout can happen after transfer: callers abort and never retry motion.
   bool ok = xSemaphoreTake(sent, pdMS_TO_TICKS(30)) == pdTRUE;
   lastReport = millis();
+  if (ok) heldButtons = report.buttons;
   return ok;
+}
+
+bool sendMouse(const MouseReport &report) {
+  if (!hidMutex) return false;
+  xSemaphoreTake(hidMutex, portMAX_DELAY);
+  bool ok = sendMouseLocked(report);
+  xSemaphoreGive(hidMutex);
+  return ok;
+}
+
+void streamReports(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (streaming) {
+      xSemaphoreTake(hidMutex, portMAX_DELAY);
+      if (!streaming) { xSemaphoreGive(hidMutex); break; }
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      unsigned fault = digitalRead(STOP_PIN) == LOW ? 1 :
+          uint32_t(millis() - lastContact.load()) > 250 ? 2 :
+          (!tud_mounted() || tud_suspended()) ? 3 : 0;
+      MouseReport report = {heldButtons, 0, 0, 0};
+      bool requested = false;
+      if (!fault) {
+        requested = xQueueReceive(streamQueue, &report, 0) == pdTRUE;
+        if (circleMotion.active && !requested) {
+          report = circleMotion.next();
+          circleReleasing = !circleMotion.active;
+        }
+      }
+      xSemaphoreGive(stateMutex);
+      // UART commands can update/query state while this transfer is pending.
+      bool completed = !fault && sendMouseLocked(report);
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      if (!fault) {
+        if (!completed) fault = 4;
+        else {
+          circleReleasing = false;
+          int64_t now = esp_timer_get_time();
+          if (reportCount) {
+            uint32_t gap = now - lastCompletion;
+            intervalMin = min(intervalMin, gap);
+            intervalMax = max(intervalMax, gap);
+            // Completion-task scheduling adds jitter; count gaps >= 1.5 ms.
+            if (gap >= 1500) ++missedSlots;
+          } else firstCompletion = now;
+          lastCompletion = now;
+          ++reportCount;
+        }
+      }
+      if (requested || fault) {
+        streamSuccess = requested && !fault;
+        xSemaphoreGive(streamDone);
+      }
+      if (fault) { streamFault = fault; streaming = false; }
+      xSemaphoreGive(stateMutex);
+      xSemaphoreGive(hidMutex);
+      // Let the equally-prioritized UART owner acquire the mutex for commands.
+      taskYIELD();
+      // No delay(1): the host's 1 ms interrupt endpoint already clocks USB.
+      // sendMouseLocked blocks until completion, then primes the next poll.
+    }
+  }
 }
 
 uint16_t crc16(const char *s) {
@@ -99,6 +176,16 @@ void releaseButtons() {
 void stopRun(const char *reason) {
   running = false;
   streaming = false;
+  if (hidMutex) {
+    xSemaphoreTake(hidMutex, portMAX_DELAY);
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    circleMotion.active = false;
+    circleReleasing = false;
+    xQueueReset(streamQueue);
+    streamFault = 0;
+    xSemaphoreGive(stateMutex);
+    xSemaphoreGive(hidMutex);
+  }
   expected = loaded = cursor = 0;
   releasePending = true;
   releaseButtons();
@@ -133,21 +220,50 @@ void command(char *s) {
   lastContact = millis();
   if (!strcmp(s, "HELLO")) {
     Serial0.printf("OK HELLO 3 %u %u %u %u USB=%u\n", MAX_EVENTS,
-                   MIN_GAP_US, MAX_DURATION_US, WATCHDOG_MS, tud_hid_n_ready(0));
+                   MIN_GAP_US, MAX_DURATION_US, WATCHDOG_MS, tud_mounted() && !tud_suspended());
   } else if (!strcmp(s, "IDENTITY")) {
     Serial0.printf("OK IDENTITY VID=%04X PID=%04X RELEASE=%04X MFR=%s PRODUCT=%s SERIAL=%s EP_IN=81 SIZE=6 INTERVAL=1 BOOT=1 SPEED=full EP0=%u\n",
                    MOUSE_USB_VID, MOUSE_USB_PID, MOUSE_DEVICE_RELEASE, MANUFACTURER_NAME,
                    PRODUCT_NAME, MOUSE_USB_SERIAL, CFG_TUD_ENDPOINT0_SIZE);
   } else if (!strcmp(s, "CAPS")) {
     Serial0.println("OK CAPS STREAM=1 MAX_AXIS=32767 WATCHDOG_MS=250");
+  } else if (!strcmp(s, "PACE")) {
+    Serial0.println("OK PACE HZ=1000 SOURCE=USB");
+  } else if (!strcmp(s, "STATS")) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    uint32_t count = reportCount, low = count > 1 ? intervalMin : 0;
+    uint32_t high = intervalMax, gaps = missedSlots;
+    int64_t elapsed = count > 1 ? lastCompletion - firstCompletion : 0;
+    bool circle = circleMotion.active || circleReleasing;
+    xSemaphoreGive(stateMutex);
+    Serial0.printf("OK STATS REPORTS=%u ELAPSED_US=%lld MIN_US=%u MAX_US=%u GAPS=%u CIRCLE=%u\n",
+                   count, elapsed, low, high, gaps, circle);
   } else if (!strcmp(s, "STREAM")) {
     stopRun(nullptr);
     if (!tud_hid_n_ready(0) || releasePending || digitalRead(STOP_PIN) == LOW) {
       stopRun("ERR NOT_READY"); return;
     }
     nextSequence = 0;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    reportCount = intervalMax = missedSlots = 0;
+    intervalMin = UINT32_MAX;
+    firstCompletion = lastCompletion = 0;
+    streamFault = 0;
+    xSemaphoreGive(stateMutex);
     streaming = true;
+    xTaskNotifyGive(streamTask);
     Serial0.println("OK STREAM");
+  } else if (!strncmp(s, "CIRCLE ", 7) && streaming) {
+    int64_t v[4];
+    // radius counts, period USB slots (1 ms each), turns, drawing button mask.
+    if (!numbers(s + 7, v, 4) || v[0] < 1 || v[0] > 1000 ||
+        v[1] < 500 || v[1] > 10000 || v[2] < 1 || v[2] > 20 ||
+        v[1] * v[2] > 60000 || (v[3] != 0 && v[3] != 1)) { stopRun("ERR CIRCLE"); return; }
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    circleMotion.start(v[0], v[1], v[2], v[3]);
+    circleReleasing = false;
+    xSemaphoreGive(stateMutex);
+    Serial0.println("OK CIRCLE");
   } else if (!strncmp(s, "M ", 2) && streaming) {
     int64_t v[5];
     if (!numbers(s + 2, v, 5) || v[0] < 0 || v[0] > UINT32_MAX ||
@@ -156,12 +272,19 @@ void command(char *s) {
         v[4] < -127 || v[4] > 127) {
       stopRun("ERR EVENT"); return;
     }
-    if (digitalRead(STOP_PIN) == LOW || !USB || !tud_hid_n_ready(0)) {
+    if (digitalRead(STOP_PIN) == LOW || !tud_mounted() || tud_suspended()) {
       stopRun("ERR NOT_READY"); return;
     }
     MouseReport report = {uint8_t(v[3]), int8_t(v[4]), int16_t(v[1]), int16_t(v[2])};
-    if (!sendMouse(report)) { stopRun("ERR HID_SEND"); return; }
-    heldButtons = report.buttons;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    bool circle = circleMotion.active || circleReleasing;
+    xSemaphoreTake(streamDone, 0);
+    streamSuccess = false;
+    bool queued = !circle && xQueueSend(streamQueue, &report, 0) == pdTRUE;
+    xSemaphoreGive(stateMutex);
+    if (!queued || xSemaphoreTake(streamDone, pdMS_TO_TICKS(50)) != pdTRUE || !streamSuccess) {
+      stopRun("ERR HID_SEND"); return;
+    }
     Serial0.printf("OK M %u\n", nextSequence++);
   } else if (!strcmp(s, "PING")) {
     Serial0.println("OK PING");
@@ -213,17 +336,33 @@ void setup() {
   USB.serialNumber(MOUSE_USB_SERIAL);
   USB.usbAttributes(0xE0); USB.usbPower(100); USB.webUSB(false);
   sent = xSemaphoreCreateBinary();
-  if (!sent || tinyusb_enable_interface(USB_INTERFACE_HID, sizeof(CONFIG_DESCRIPTOR) - 9,
+  hidMutex = xSemaphoreCreateMutex();
+  stateMutex = xSemaphoreCreateMutex();
+  streamDone = xSemaphoreCreateBinary();
+  streamQueue = xQueueCreate(1, sizeof(MouseReport));
+  if (!sent || !hidMutex || !stateMutex || !streamDone || !streamQueue || tinyusb_enable_interface(USB_INTERFACE_HID, sizeof(CONFIG_DESCRIPTOR) - 9,
                                         loadMouseInterface) != ESP_OK) {
     Serial0.println("ERR USB_INIT");
     return;
   }
   if (!USB.begin()) { Serial0.println("ERR USB_INIT"); return; }
+  // Keep the producer on the UART task's core: taskYIELD then hands a released
+  // mutex to that task instead of immediately reacquiring it on another core.
+  if (xTaskCreatePinnedToCore(streamReports, "hid-stream", 4096, nullptr,
+      uxTaskPriorityGet(nullptr), &streamTask, xPortGetCoreID()) != pdPASS) {
+    Serial0.println("ERR TASK_INIT"); return;
+  }
   lastContact = millis();
   Serial0.println("READY MOUSE_RELAY 3");
 }
 
 void loop() {
+  if (!streamTask) { delay(100); return; }
+  unsigned fault = streamFault.exchange(0);
+  if (fault) {
+    const char *reasons[] = {"", "ERR SWITCH", "ERR WATCHDOG", "ERR USB_DISCONNECTED", "ERR HID_SEND"};
+    stopRun(reasons[fault]);
+  }
   if (streaming) {
     if (digitalRead(STOP_PIN) == LOW) stopRun("ERR SWITCH");
     else if (uint32_t(millis() - lastContact) > 250) stopRun("ERR WATCHDOG");
@@ -245,8 +384,8 @@ void loop() {
   releaseButtons();
   if (!running) {
     uint8_t rate = idleRate.load();
-    if (rate && !releasePending && tud_hid_n_ready(0) &&
-        uint32_t(millis() - lastReport) >= uint32_t(rate) * 4) {
+    if (!streaming && rate && !releasePending && tud_hid_n_ready(0) &&
+        uint32_t(millis() - lastReport.load()) >= uint32_t(rate) * 4) {
       sendMouse({heldButtons, 0, 0, 0});
     }
     delay(1); return;

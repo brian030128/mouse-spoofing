@@ -23,12 +23,29 @@ with the original batch capacity, timing and watchdog fields. IDENTITY reports
 the preserved M2K profile. Commands:
 
 - `CAPS` returns `OK CAPS STREAM=1 MAX_AXIS=32767 WATCHDOG_MS=250`.
+- `PACE` returns `OK PACE HZ=1000 SOURCE=USB` on the updated firmware. The USB
+  producer task primes each next report after completion; the unchanged 1 ms
+  endpoint interval clocks delivery. It sends zero movement with held buttons
+  between input updates, so stale relative displacement is never repeated.
 - `STREAM` releases prior state and starts a session with sequence number zero.
   Requires a ready USB host and an unpressed stop switch.
-- `M sequence dx dy buttons wheel` immediately sends one HID report and returns
+- `M sequence dx dy buttons wheel` supplies the next USB-slot report and returns
   `OK M sequence` only after transfer completion. Sequence numbers increase
   modulo 2^32. Axes are -32767..32767, buttons 0..7, wheel -127..127.
   Button state persists across reports, enabling holds and dragging.
+- `CIRCLE radius period_slots turns buttons` generates circles locally at one
+  sample per USB report. Radius is 1..1000 HID counts, period is 500..10000
+  reports (nominal milliseconds), turns is 1..20, and total is <=60000 reports.
+  Buttons is 0 for cursor movement or 1 for left-button drawing. The cursor
+  starts at the circle's right edge; every turn has exactly zero net HID
+  displacement. A final zero-motion report releases drawing before completion.
+  `M` during an active circle stops with an error instead of mixing movements.
+- `STATS` returns `OK STATS REPORTS=n ELAPSED_US=n MIN_US=n MAX_US=n GAPS=n CIRCLE=n`.
+  Counts/timing reset on STREAM. ELAPSED_US spans the first through last
+  completed streaming reports; average Hz is `(REPORTS-1)*1000000/ELAPSED_US`.
+  GAPS counts completion-task intervals >=1500 us. CIRCLE stays 1 until the
+  generator's final release has been processed. Timestamps include firmware
+  task wake-up jitter and are not receiver-side packet timestamps.
 - `PING` keeps the session alive without changing button state.
 - Plain `STOP` discards movement and releases buttons.
 
@@ -41,6 +58,24 @@ Buttons are released when USB becomes available again after a disconnect.
 Streaming removes the LOAD/E/RUN start delay. Batch mode still requires its
 final report to release buttons and retains a 10 ms minimum event interval.
 USB remains full-speed, with the original 6-byte report and 1 ms endpoint.
+The dedicated USB task continues while UART reads/writes and acknowledgements
+run on the Arduino task. Normal serial source updates remain transport-limited;
+continuous USB reporting does not invent new measured movement samples. The
+circle command provides fresh device-generated movement every USB slot for
+testing. STREAM's 250 ms watchdog and physical stop input apply to circles too.
+
+From the parent project, `python tools/mouse_circle_test.py --port COM6` runs
+three click-free circles after a five-second countdown and saves timing JSON.
+Add `--draw` only with a blank drawing canvas focused on the receiving PC.
+On 2026-10-30 the updated build was flashed to app0 on COM6 after backing up
+the previous 3 MiB application to the parent project's `runs/hardware_backups/`.
+The flash tool verified its written hash. Three click-free circles completed;
+the receiving user confirmed the visible motion. Across 4115 reports, firmware
+completion-task timing measured 999.995 Hz, minimum 992 us, maximum 1008 us and
+zero gaps >=1.5 ms. All original device/configuration/report descriptor bytes
+were found unchanged in the new application. This is completion timing and
+visual confirmation, not a receiver-side packet capture. The following older
+measurements describe the previous, UART-paced build.
 
 ## Build
 
